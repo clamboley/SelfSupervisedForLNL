@@ -30,13 +30,13 @@ def get_arguments():
     )
 
     # Backbone
-    parser.add_argument("--method", type=str, default="vicreg", choices=('vicreg', 'simclr'),
+    parser.add_argument("--method", type=str, default="vicreg", choices=('vicreg', 'simclr', 'byol', 'moco', 'caco'),
                         help='Self-Supervised Learning algorithm used to create encoder')
-    parser.add_argument("--arch", type=str, default="resnet18",
+    parser.add_argument("--arch", type=str, default="resnet34",
                         choices=('resnet18', 'resnet34', 'resnet50', 'resnet101',
                                  'resnet50x2', 'resnet50x4', 'resnet50x5', 'resnet200x2'),
                         help='Architecture of the backbone encoder network')
-    parser.add_argument("--arch-epochs", type=int, default=2000)
+    parser.add_argument("--arch-epochs", type=int, default=5000)
 
     # SSL hyperparameters
     parser.add_argument("--std-coeff", "-V", type=float, default=25.0,
@@ -45,10 +45,17 @@ def get_arguments():
                         help='Invariance regularization loss coefficient')
     parser.add_argument("--cov-coeff", "-C", type=float, default=1.0,
                         help='Covariance regularization loss coefficient')
+    parser.add_argument("--queue-size", "-Q", type=int, default=256,
+                        help='Size of memory queue, must be divisible by batch size')
+    parser.add_argument("--momentum", "-M", type=float, default=0.999,
+                        help='Momentum for the key encoder update')
+    parser.add_argument("--mem-temperature", type=float, default=0.07,
+                        help='Memory temperature')
+    parser.add_argument("--mem-lr", type=float, default=3.0,
+                        help='Memory learning rate')
     parser.add_argument("--temperature", "-T", type=float, default=0.5,
-                        help='Temperature for NTXent loss')
-    parser.add_argument("--batch-size", type=int, default=256,
-                        help='Batch size used for SimCLR')
+                        help='InfoNCE/NTXent temperature factor')
+    parser.add_argument("--arch-batch-size", default=256, type=int, metavar="N", help="Batch size")
 
     # MLP
     parser.add_argument("--weights", default="freeze", type=str, choices=("finetune", "freeze"),
@@ -67,11 +74,8 @@ def get_arguments():
 
 
 def plot_encoder_training(args):
-    results_path = {'vicreg': os.path.join("VICReg", f"{args.arch}_{args.arch_epochs}",
-                                           f"V{args.std_coeff}_I{args.sim_coeff}_C{args.cov_coeff}"),
-                    'simclr': os.path.join("SimCLR", f"{args.arch}_{args.arch_epochs}",
-                                           f"T{args.temperature}_B{args.batch_size}")}
-    path = Path(args.exp_dir / results_path[args.method] / "encoder")
+
+    path = Path(args.exp_dir / args.results_path / "encoder")
     full_dict = {"epoch": [], "step": [], "loss": [], "time": [], "lr": []}
 
     with open(path / "stats.txt") as stats_file:
@@ -94,11 +98,8 @@ def plot_encoder_training(args):
 
 
 def plot_mlp_training(args):
-    results_path = {'vicreg': os.path.join("VICReg", f"{args.arch}_{args.arch_epochs}",
-                                           f"V{args.std_coeff}_I{args.sim_coeff}_C{args.cov_coeff}"),
-                    'simclr': os.path.join("SimCLR", f"{args.arch}_{args.arch_epochs}",
-                                           f"T{args.temperature}_B{args.batch_size}")}
-    path = Path(args.exp_dir / results_path[args.method] / f"mlp_{args.weights}")
+
+    path = Path(args.exp_dir / args.results_path / f"mlp_{args.weights}")
 
     train_dict = {'epoch': [], 'step': [], 'lr_backbone': [], 'lr_head': [], 'loss': [], 'time': []}
     test_dict = {'epoch': [], 'acc1': [], 'acc5': [], 'best_acc1': [], 'best_acc5': []}
@@ -136,11 +137,8 @@ def plot_mlp_training(args):
 
 
 def show_acc_table(args):
-    results_path = {'vicreg': os.path.join("VICReg", f"{args.arch}_{args.arch_epochs}",
-                                           f"V{args.std_coeff}_I{args.sim_coeff}_C{args.cov_coeff}"),
-                    'simclr': os.path.join("SimCLR", f"{args.arch}_{args.arch_epochs}",
-                                           f"T{args.temperature}_B{args.batch_size}")}
-    path = Path(args.exp_dir / results_path[args.method] / f"mlp_{args.weights}")
+
+    path = Path(args.exp_dir / args.results_path / f"mlp_{args.weights}")
 
     print('-' * (10 + (7 * len(args.sparsities))))
     print('  NOISE |', end='')
@@ -182,6 +180,17 @@ def show_acc_table(args):
 
 
 def test(args):
+    args.results_path = {'vicreg': os.path.join("VICReg", f"{args.arch}_{args.arch_epochs}",
+                                                f"V{args.std_coeff}_I{args.sim_coeff}_C{args.cov_coeff}"),
+                         'simclr': os.path.join("SimCLR", f"{args.arch}_{args.arch_epochs}",
+                                                f"T{args.temperature}_B{args.arch_batch_size}"),
+                         'byol': os.path.join("BYOL", f"{args.arch}_{args.arch_epochs}"),
+                         'moco': os.path.join("MoCo", f"{args.arch}_{args.arch_epochs}",
+                                              f"T{args.mem_temperature}_B{args.arch_batch_size}"
+                                              f"_M{args.momentum}_Q{args.queue_size}"),
+                         'caco': os.path.join("CaCo", f"{args.arch}_{args.arch_epochs}",
+                                              f"T{args.mem_temperature}_B{args.arch_batch_size}"
+                                              f"_M{args.momentum}_Q{args.queue_size}")}
 
     if args.encoder_hist:
         plot_encoder_training(args)

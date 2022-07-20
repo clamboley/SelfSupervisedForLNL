@@ -14,13 +14,15 @@ import random
 import signal
 import sys
 import time
-import urllib
 
-from torch import nn, optim, Tensor
-import torch.nn.functional as F
-from torchvision import datasets, transforms
 import torch
+import torch.nn.functional as F
+from torch import nn, optim
+from torchvision import transforms
+from torch.utils.data import random_split
 
+from utils import ImageFolderModified, CIFAR10N
+from utils import XEntropyLoss, ELRlossRunningAvg
 import resnet
 
 
@@ -32,10 +34,29 @@ def get_arguments():
     # Data
     parser.add_argument("--data-dir", type=Path, help="path to dataset", default="")
 
+    # CIFAR10_N dataset
+    parser.add_argument("--cifar10N", default=False, action="store_true")
+    parser.add_argument(
+        "--noise-type",
+        default='aggre',
+        type=str,
+        choices=('clean', 'aggre', 'worst', 'rand1', 'rand2', 'rand3', 'clean100', 'noisy100'),
+        help='clean, aggre, worst, rand1, rand2, rand3, clean100, noisy100',
+    )
+
     # Label noise
     parser.add_argument("--noise", default=0.0, type=float, help="label noise")
     parser.add_argument("--sparsity", default=0.0, type=float, help="label sparsity")
     parser.add_argument("--seed", default=0, type=int, help="seed used for noise generation")
+
+    # Percentage for semi-supervised
+    parser.add_argument(
+        "--train-percent",
+        default=100,
+        type=int,
+        choices=(100, 10, 1),
+        help="Size of training set in percent",
+    )
 
     # Checkpoint
     parser.add_argument(
@@ -50,7 +71,7 @@ def get_arguments():
     )
 
     # Backbone
-    parser.add_argument("--method", type=str, default="vicreg", choices=('vicreg', 'simclr'),
+    parser.add_argument("--method", type=str, default="vicreg", choices=('vicreg', 'simclr', 'byol', 'moco', 'caco'),
                         help='Self-Supervised Learning algorithm used to create encoder')
     parser.add_argument("--arch", type=str, default="resnet18",
                         choices=('resnet18', 'resnet34', 'resnet50', 'resnet101',
@@ -65,9 +86,17 @@ def get_arguments():
                         help='Invariance regularization loss coefficient')
     parser.add_argument("--cov-coeff", "-C", type=float, default=1.0,
                         help='Covariance regularization loss coefficient')
+    parser.add_argument("--queue-size", "-Q", type=int, default=256,
+                        help='Size of memory queue, must be divisible by batch size')
+    parser.add_argument("--momentum", "-M", type=float, default=0.999,
+                        help='Momentum for the key encoder update')
+    parser.add_argument("--mem-temperature", type=float, default=0.07,
+                        help='Memory temperature')
+    parser.add_argument("--mem-lr", type=float, default=3.0,
+                        help='Memory learning rate')
     parser.add_argument("--temperature", "-T", type=float, default=0.5,
-                        help='Covariance regularization loss coefficient')
-    parser.add_argument("--arch-batch-size", default=256, type=int, metavar="N", help="SimCLR batch size")
+                        help='InfoNCE/NTXent temperature factor')
+    parser.add_argument("--arch-batch-size", default=256, type=int, metavar="N", help="Batch size")
 
     # Optim
     parser.add_argument('--loss', default='crossentropy', type=str, choices=('crossentropy', 'elr'))
@@ -145,14 +174,28 @@ def main_worker(gpu, args):
     results_path = {'vicreg': os.path.join("VICReg", f"{args.arch}_{args.arch_epochs}",
                                            f"V{args.std_coeff}_I{args.sim_coeff}_C{args.cov_coeff}"),
                     'simclr': os.path.join("SimCLR", f"{args.arch}_{args.arch_epochs}",
-                                           f"T{args.temperature}_B{args.arch_batch_size}")}
+                                           f"T{args.temperature}_B{args.arch_batch_size}"),
+                    'byol': os.path.join("BYOL", f"{args.arch}_{args.arch_epochs}"),
+                    'moco': os.path.join("MoCo", f"{args.arch}_{args.arch_epochs}",
+                                         f"T{args.mem_temperature}_B{args.arch_batch_size}"
+                                         f"_M{args.momentum}_Q{args.queue_size}"),
+                    'caco': os.path.join("CaCo", f"{args.arch}_{args.arch_epochs}",
+                                         f"T{args.mem_temperature}_B{args.arch_batch_size}"
+                                         f"_M{args.momentum}_Q{args.queue_size}")}
     encoder_dir = Path(args.exp_dir / results_path[args.method] / "encoder")
     mlp_dir = Path(args.exp_dir / results_path[args.method] / f"mlp_{args.weights}")
 
     if args.rank == 0:
         mlp_dir.mkdir(parents=True, exist_ok=True)
-        stats_file = open(mlp_dir / f'seed{args.seed}_n{args.noise}_s{args.sparsity}_{args.loss}_stats.txt',
-                          "w", buffering=1)
+        if args.cifar10N:
+            stats_file = open(mlp_dir / f'cifar10N_{args.noise_type}_{args.loss}_stats.txt', "w", buffering=1)
+        else:
+            if args.train_percent != 100:
+                stats_file = open(mlp_dir / f'percent{args.train_percent}_stats.txt', "w", buffering=1)
+                args.print_freq = max(1, int(args.train_percent * args.print_freq / 100))
+            else:
+                stats_file = open(mlp_dir / f'seed{args.seed}_n{args.noise}_s{args.sparsity}_{args.loss}_stats.txt',
+                                  "w", buffering=1)
         print(" ".join(sys.argv))
         print(" ".join(sys.argv), file=stats_file)
 
@@ -193,9 +236,6 @@ def main_worker(gpu, args):
     start_epoch = 0
     best_acc = argparse.Namespace(top1=0, top5=0)
 
-    # Data loading code
-    traindir = os.path.join(args.data_dir, 'cifar10_dataset', 'base_dataset', 'train')
-    testdir = os.path.join(args.data_dir, 'cifar10_dataset', 'base_dataset', 'test')
     train_transfo = transforms.Compose(
         [
             transforms.RandomResizedCrop(32),
@@ -211,18 +251,44 @@ def main_worker(gpu, args):
         ]
     )
 
-    train_dataset = ImageFolderModified(traindir, train_transfo)
-    test_dataset = ImageFolderModified(testdir, test_transfo)
+    # Data loading code
+    if args.cifar10N:
+        train_dataset = CIFAR10N(
+            root=args.data_dir / "cifar10_dataset_official",
+            download=False,
+            train=True,
+            transform=train_transfo,
+            noise_type=args.noise_type,
+            noise_path=args.data_dir / "cifar10_dataset_official" / "cifar10N.pt",
+            is_human=True,  # Affichage
+        )
+        test_dataset = CIFAR10N(
+            root=args.data_dir / "cifar10_dataset_official",
+            download=False,
+            train=False,
+            transform=test_transfo,
+            noise_type=args.noise_type
+        )
+    else:
+        traindir = os.path.join(args.data_dir, 'cifar10_dataset', 'base_dataset', 'train')
+        testdir = os.path.join(args.data_dir, 'cifar10_dataset', 'base_dataset', 'test')
+        train_dataset = ImageFolderModified(traindir, train_transfo)
+        test_dataset = ImageFolderModified(testdir, test_transfo)
 
-    labels_path = os.path.join(args.data_dir, 'cifar10_dataset', 'noisy_labels_{}'.format(args.seed),
-                               'noisylabels_noise{}_sparsity{}.json'.format(args.noise, args.sparsity))
-    with open(labels_path) as rf:
-        tmp = json.load(rf)
-    train_labels_dict = {}
-    for k in tmp:
-        train_labels_dict[os.path.join(args.data_dir, k)] = tmp[k]
-    train_dataset.imgs = [(fn, train_labels_dict[fn]) for fn, _ in train_dataset.imgs]
-    train_dataset.samples = train_dataset.imgs
+        if args.train_percent != 100:
+            tr_size = int(args.train_percent * len(train_dataset) / 100)
+            train_dataset, _ = random_split(train_dataset, [tr_size, len(train_dataset)-tr_size])
+
+        else:
+            labels_path = os.path.join(args.data_dir, 'cifar10_dataset', 'noisy_labels_{}'.format(args.seed),
+                                       'noisylabels_noise{}_sparsity{}.json'.format(args.noise, args.sparsity))
+            with open(labels_path) as rf:
+                tmp = json.load(rf)
+            train_labels_dict = {}
+            for k in tmp:
+                train_labels_dict[os.path.join(args.data_dir, k)] = tmp[k]
+            train_dataset.imgs = [(fn, train_labels_dict[fn]) for fn, _ in train_dataset.imgs]
+            train_dataset.samples = train_dataset.imgs
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     kwargs = dict(
@@ -233,9 +299,8 @@ def main_worker(gpu, args):
     train_loader = torch.utils.data.DataLoader(train_dataset, sampler=train_sampler, **kwargs)
     test_loader = torch.utils.data.DataLoader(test_dataset, **kwargs)
 
-    str_loss = args.loss
-    if str_loss == 'crossentropy':
-        criterion = nn.CrossEntropyLoss().cuda(gpu)
+    if args.loss == 'crossentropy' or args.train_percent != 100:
+        criterion = XEntropyLoss().cuda(gpu)
     else:
         criterion = ELRlossRunningAvg(device=gpu, num_examp=len(train_dataset), lambda_elr=3, beta=0.7)
 
@@ -256,10 +321,9 @@ def main_worker(gpu, args):
             train_loader, start=epoch * len(train_loader)
         ):
             output = model(images.cuda(gpu, non_blocking=True))
-            if str_loss == 'crossentropy':
-                loss = criterion(output, target.cuda(gpu, non_blocking=True))
-            else:
-                loss = criterion(output, target.cuda(gpu, non_blocking=True), idx)
+
+            loss = criterion(output, target.cuda(gpu, non_blocking=True), idx)
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -364,43 +428,6 @@ def accuracy(output, target, topk=(1,)):
             correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
-
-
-class ELRlossRunningAvg(nn.Module):
-    def __init__(self, device, num_examp, num_classes=10, lambda_elr=3, beta=0.7):
-        super(ELRlossRunningAvg, self).__init__()
-        self.num_classes = num_classes
-        self.target = torch.zeros(num_examp, self.num_classes).to(device)
-        self.beta = beta
-        self.lambda_elr = lambda_elr
-
-    def forward(self, output, label, index):
-        y_pred = F.softmax(output, dim=1)
-        y_pred = torch.clamp(y_pred, 1e-4, 1.0-1e-4)
-        y_pred_ = y_pred.data.detach()
-        self.target[index] = self.beta * self.target[index] + (1 - self.beta) * (y_pred_/y_pred_.sum(dim=1,
-                                                                                                     keepdims=True))
-        ce_loss = F.cross_entropy(output, label)
-        elr_reg = ((1 - (self.target[index] * y_pred).sum(dim=1)).log()).mean()
-        final_loss = ce_loss + self.lambda_elr * elr_reg
-
-        return final_loss
-
-
-# Image folder returning "index" for the ELR loss
-class ImageFolderModified(datasets.ImageFolder):
-    def __init__(self, root, transform):
-        super(ImageFolderModified, self).__init__(root, transform)
-
-    def __getitem__(self, index):
-        path, target = self.samples[index]
-        sample = self.loader(path)
-        if self.transform is not None:
-            sample = self.transform(sample)
-        if self.target_transform is not None:
-            target = self.target_transform(target)
-
-        return sample, target, index
 
 
 if __name__ == "__main__":

@@ -1,3 +1,10 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+
 from pathlib import Path
 import argparse
 import json
@@ -7,15 +14,14 @@ import sys
 import time
 
 import torch
-import torch.nn.functional as F
 from torch import nn, optim
-import torch.distributed as dist
 import torchvision.datasets as datasets
 
 import augmentations as aug
 from distributed import init_distributed_mode
 
 import resnet
+from methods import VICReg, SimCLR, BYOL, MoCo, CaCo
 
 
 def get_arguments():
@@ -32,7 +38,7 @@ def get_arguments():
                         help='Print logs to the stats.txt file every [log-freq-time] seconds')
 
     # Model
-    parser.add_argument("--method", type=str, default="vicreg", choices=('vicreg', 'simclr'),
+    parser.add_argument("--method", type=str, default="vicreg", choices=('vicreg', 'simclr', 'byol', 'moco', 'caco'),
                         help='Self-Supervised Learning algorithm to use')
     parser.add_argument("--arch", type=str, default="resnet18",
                         choices=('resnet18', 'resnet34', 'resnet50', 'resnet101',
@@ -59,9 +65,19 @@ def get_arguments():
     parser.add_argument("--cov-coeff", "-C", type=float, default=1.0,
                         help='Covariance regularization loss coefficient')
 
-    # SimCLR loss hyperparameter
+    # MoCo/CaCo hyperparameters
+    parser.add_argument("--queue-size", "-Q", type=int, default=256,
+                        help='Size of memory queue, must be divisible by batch size')
+    parser.add_argument("--momentum", "-M", type=float, default=0.999,
+                        help='Momentum for the key encoder update')
+    parser.add_argument("--mem-temperature", type=float, default=0.07,
+                        help='Memory temperature')
+    parser.add_argument("--mem-lr", type=float, default=3.0,
+                        help='Memory learning rate')
+
+    # SimCLR loss temperature hyperparameter
     parser.add_argument("--temperature", "-T", type=float, default=0.5,
-                        help='Covariance regularization loss coefficient')
+                        help='InfoNCE/NTXent temperature factor')
 
     # Running
     parser.add_argument("--num-workers", type=int, default=1)
@@ -88,7 +104,17 @@ def main(args):
                                               "encoder"),
                        'simclr': os.path.join("SimCLR", f"{args.arch}_{args.epochs}",
                                               f"T{args.temperature}_B{args.batch_size}",
-                                              "encoder")}
+                                              "encoder"),
+                       'byol': os.path.join("BYOL", f"{args.arch}_{args.epochs}",
+                                            "encoder"),
+                       'moco': os.path.join("MoCo", f"{args.arch}_{args.epochs}",
+                                            f"T{args.mem_temperature}_B{args.batch_size}"
+                                            f"_M{args.momentum}_Q{args.queue_size}",
+                                            "encoder"),
+                       'caco': os.path.join("CaCo", f"{args.arch}_{args.epochs}",
+                                            f"T{args.mem_temperature}_B{args.batch_size}"
+                                            f"_M{args.momentum}_Q{args.queue_size}",
+                                            "encoder")}
     results_dir = Path(args.exp_dir / path_to_encoder[args.method])
 
     if args.rank == 0:
@@ -118,6 +144,17 @@ def main(args):
         model = VICReg(args).cuda(gpu)
     elif args.method == 'simclr':
         model = SimCLR(args).cuda(gpu)
+    elif args.method == 'byol':
+        mlp_last_layer = int(args.mlp.split("-")[-1])
+        _, output_size = resnet.__dict__[args.arch]( zero_init_residual=True)
+        if mlp_last_layer != output_size:
+            raise ValueError(f"Size of the MLP's last layer ({mlp_last_layer}) "
+                             f"incompatible with the output size of the encoder ({output_size})")
+        model = BYOL(args).cuda(gpu)
+    elif args.method == 'moco':
+        model = MoCo(args).cuda(gpu)
+    elif args.method == 'caco':
+        model = CaCo(args).cuda(gpu)
     else:
         model = VICReg(args).cuda(gpu)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -255,127 +292,8 @@ def adjust_learning_rate(args, optimizer, loader, step):
     return lr
 
 
-class VICReg(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        self.args = args
-        self.num_features = int(args.mlp.split("-")[-1])
-        self.backbone, self.embedding = resnet.__dict__[args.arch](
-            zero_init_residual=True
-        )
-        self.projector = head_projector(args, self.embedding)
-
-    def forward(self, x, y):
-        x = self.projector(self.backbone(x))
-        y = self.projector(self.backbone(y))
-
-        repr_loss = F.mse_loss(x, y)
-
-        x = torch.cat(FullGatherLayer.apply(x), dim=0)
-        y = torch.cat(FullGatherLayer.apply(y), dim=0)
-        x = x - x.mean(dim=0)
-        y = y - y.mean(dim=0)
-
-        std_x = torch.sqrt(x.var(dim=0) + 0.0001)
-        std_y = torch.sqrt(y.var(dim=0) + 0.0001)
-        std_loss = torch.mean(F.relu(1 - std_x)) / 2 + torch.mean(F.relu(1 - std_y)) / 2
-
-        cov_x = (x.T @ x) / (self.args.batch_size - 1)
-        cov_y = (y.T @ y) / (self.args.batch_size - 1)
-        cov_loss = off_diagonal(cov_x).pow_(2).sum().div(
-            self.num_features
-        ) + off_diagonal(cov_y).pow_(2).sum().div(self.num_features)
-
-        loss = (
-            self.args.sim_coeff * repr_loss
-            + self.args.std_coeff * std_loss
-            + self.args.cov_coeff * cov_loss
-        )
-        return loss
-
-
-class SimCLR(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        self.args = args
-        self.num_features = int(args.mlp.split("-")[-1])
-        self.backbone, self.embedding = resnet.__dict__[args.arch](
-            zero_init_residual=True
-        )
-        self.projector = head_projector(args, self.embedding)
-
-    def forward(self, x, y):
-        x = self.projector(self.backbone(x))
-        y = self.projector(self.backbone(y))
-
-        x = F.normalize(x, dim=-1)
-        y = F.normalize(y, dim=-1)
-
-        x = torch.cat(FullGatherLayer.apply(x), dim=0)
-        y = torch.cat(FullGatherLayer.apply(y), dim=0)
-
-        # [2*B, D]
-        out = torch.cat([x, y], dim=0)
-        # [2*B, 2*B]
-        sim_matrix = torch.exp(torch.mm(out, out.t().contiguous()) / self.args.temperature)
-        mask = (torch.ones_like(sim_matrix) - torch.eye(2 * self.args.batch_size, device=sim_matrix.device)).bool()
-        # [2*B, 2*B-1]
-        sim_matrix = sim_matrix.masked_select(mask).view(2 * self.args.batch_size, -1)
-
-        # compute loss
-        pos_sim = torch.exp(torch.sum(x * y, dim=-1) / self.args.temperature)
-        # [2*B]
-        pos_sim = torch.cat([pos_sim, pos_sim], dim=0)
-
-        loss = (- torch.log(pos_sim / sim_matrix.sum(dim=-1))).mean()
-
-        return loss
-
-
-def head_projector(args, embedding):
-    mlp_spec = f"{embedding}-{args.mlp}"
-    layers = []
-    f = list(map(int, mlp_spec.split("-")))
-    for i in range(len(f) - 2):
-        layers.append(nn.Linear(f[i], f[i + 1]))
-        layers.append(nn.BatchNorm1d(f[i + 1]))
-        layers.append(nn.ReLU(True))
-    layers.append(nn.Linear(f[-2], f[-1], bias=False))
-    return nn.Sequential(*layers)
-
-
 def exclude_bias_and_norm(p):
     return p.ndim == 1
-
-
-def off_diagonal(x):
-    n, m = x.shape
-    assert n == m
-    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
-
-
-def batch_all_gather(x):
-    x_list = FullGatherLayer.apply(x)
-    return torch.cat(x_list, dim=0)
-
-
-class FullGatherLayer(torch.autograd.Function):
-    """
-    Gather tensors from all process and support backward propagation
-    for the gradients across processes.
-    """
-
-    @staticmethod
-    def forward(ctx, x):
-        output = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
-        dist.all_gather(output, x)
-        return tuple(output)
-
-    @staticmethod
-    def backward(ctx, *grads):
-        all_gradients = torch.stack(grads)
-        dist.all_reduce(all_gradients)
-        return all_gradients[dist.get_rank()]
 
 
 def handle_sigusr1(signum, frame):

@@ -1,17 +1,24 @@
 # Self-Supervised Learning applied to Learning with Noisy Labels
 
-PyTorch implementation of SimCLR (https://arxiv.org/abs/2002.05709) and VICReg (https://arxiv.org/abs/2105.04906)
-applied for Learning with Noisy Labels on CIFAR10, using DistributedDataParallel for multi-nodes multi-gpus training.
+PyTorch implementation of Self Supervised Architectures applied for Learning with Noisy Labels on CIFAR10,
+using DistributedDataParallel for multi-nodes multi-gpus training.
 
--> Adapted from Bardes, Ponce and Yann LeCun's VICReg implementation.
+Implemented : 
+- SimCLR (https://arxiv.org/abs/2002.05709),
+- VICReg (https://arxiv.org/abs/2105.04906),
+- BYOL (https://arxiv.org/abs/2006.07733),
+- MoCo (https://arxiv.org/abs/1911.05722),
+- CaCo (https://arxiv.org/abs/2203.14370v1)
+
+###### Adapted from Bardes, Ponce and Yann LeCun's VICReg implementation.
 
 ---
 
 ## Pretraining
 
 ### Single-node local training
-
-To pretrain SimCLR (or VICReg) with ResNet-18 on a single node with 8 GPUs for 100 epochs, run:
+ 
+To pretrain SimCLR with ResNet-18 on a singlenode with 8 GPUs for 100 epochs, run:
 
 ```
 python -m torch.distributed.launch --nproc_per_node=8 main.py --data-dir /path/to/cifar10_dataset --exp-dir /path/to/results --method simclr --arch resnet18 --epochs 100 --batch-size 256 -T 0.5 --base-lr 0.2
@@ -19,7 +26,7 @@ python -m torch.distributed.launch --nproc_per_node=8 main.py --data-dir /path/t
 
 ### Multi-node training with SLURM
 
-To pretrain VICReg (or SimCLR) with [submitit](https://github.com/facebookincubator/submitit) and SLURM on 4 nodes with 8 GPUs each for 100 epochs, run:
+To pretrain VICReg with [submitit](https://github.com/facebookincubator/submitit) and SLURM on 4 nodes with 8 GPUs each for 100 epochs, run:
 
 ```
 python run_with_submitit.py --nodes 4 --ngpus 8 --data-dir /path/to/cifar10_dataset --exp-dir /path/to/results --method vicreg --arch resnet50 --epochs 100 --batch-size 256 -V 25.0 -I 25.0 -C 1.0 --base-lr 0.2
@@ -34,6 +41,8 @@ Label noise configurations are generated in "cifar10_create_label_errors.py". It
 label flipping. We generate noise in (0%, 10%, 20%, 30%, 40%, 50%, 60%, 70%), same for sparsity, with 5 different seeds
 using the [Cleanlab](github.com/cleanlab/cleanlab) package.
 
+Human annotated cifar10 is also provided, using the [Cifar-1On](https://github.com/UCSC-REAL/cifar-10-100n) dataset.
+
 ### Linear evaluation on different noise levels
 
 To evaluate a pretrained ResNet-34 backbone on linear classification on CIFAR10 with 40% noise, 20% sparsity,
@@ -45,3 +54,11 @@ python evaluate.py --data-dir /path/to/cifar10_dataset --exp-dir /path/to/result
 
 Note that the --loss argument gives you the choice between a simple CrossEntropy loss, or the
 Early Learning Regularization loss ([ELR](https://arxiv.org/abs/2007.00151))
+
+### Linear evaluation with 10% or 1% of the training set
+
+To evaluate a pretrained ResNet-50 backbone on linear classification on CIFAR10 with 10% of the training images, run:
+
+```
+python evaluate.py --data-dir /path/to/cifar10_dataset --exp-dir /path/to/results --method byol --arch resnet50 --arch-epochs 1000 --train-percent 10
+```
